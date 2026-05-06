@@ -21,5 +21,5 @@ jobs:
             set -e
             cd /opt/telegram-bot
             git pull origin main
-            sudo docker compose up -d --build
-            sudo docker compose ps
+            docker compose up -d --build
+            docker compose ps
