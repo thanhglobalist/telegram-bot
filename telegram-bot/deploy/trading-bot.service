@@ -1,0 +1,32 @@
+[Unit]
+Description=Telegram Trading Signals + News Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust these paths to match where you cloned the repo on the VPS
+WorkingDirectory=/opt/telegram-bot
+EnvironmentFile=/opt/telegram-bot/.env
+ExecStart=/opt/telegram-bot/.venv/bin/python -m app.bot
+
+# Resilience
+Restart=on-failure
+RestartSec=10s
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Hardening
+User=botuser
+Group=botuser
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+# Logs go to journald
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

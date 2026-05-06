@@ -1,0 +1,18 @@
+services:
+  bot:
+    build: .
+    container_name: trading-signals-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+    # Expose the webhook port only when WEBHOOK_ENABLED=true in .env.
+    # Comment this out if you only use email bridge or pure long-polling.
+    ports:
+      - "8080:8080"
+    # Keep stdout logs visible
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
