@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
 from telegram import (
@@ -503,7 +502,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         T("stats_channel", lang, dot=chan_dot, ch=channel_label),
         "",
         T("stats_schedule", lang),
-        T("stats_daily", lang, time=cfg.daily_news_time, tz=cfg.timezone),
+        T("stats_news_manual", lang),
         T("stats_pending", lang, n=len(pending)),
         "",
         T("stats_integrations", lang),
@@ -543,7 +542,155 @@ async def cmd_sendnews(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.effective_message.reply_text(T("admin_only", lang))
         return
     await update.effective_message.reply_text(T("sendnews_triggered", lang))
-    await _job_daily_news(context)
+    await _send_news_digest(context)
+
+
+def _fmt_bytes(n: int) -> str:
+    """Human-friendly byte size: 12.3 KB / 4.5 MB / etc."""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    if n < 1024 * 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f} MB"
+    return f"{n / (1024 * 1024 * 1024):.2f} GB"
+
+
+async def cmd_dbstats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show database health snapshot. Admin-only."""
+    cfg: Config = context.application.bot_data["cfg"]
+    db: Database = context.application.bot_data["db"]
+    user = update.effective_user
+    msg = update.effective_message
+    lang = _resolve_lang(db, user)
+    if user is None or not _is_admin(cfg, user.id):
+        await msg.reply_text(T("admin_only", lang))
+        return
+
+    s = await asyncio.to_thread(db.stats)
+
+    integrity_dot = "\U0001f7e2" if s.integrity_ok else "\U0001f534"
+    integrity_label = "OK" if s.integrity_ok else "CORRUPT"
+    frag = s.fragmentation_pct
+    frag_dot = "\U0001f7e2" if frag < 10 else ("\U0001f7e1" if frag < 25 else "\U0001f534")
+
+    lines = [
+        "\U0001f5c4\ufe0f <b>Database health</b>",
+        DIVIDER,
+        "",
+        "<b>\U0001f4be Storage</b>",
+        f"\u251c \U0001f4c1 File size: <b>{_fmt_bytes(s.file_bytes)}</b>",
+        f"\u251c \U0001f4d0 Pages: <b>{s.page_count}</b> \u00d7 {s.page_size} B",
+        f"\u251c {frag_dot} Fragmentation: <b>{frag}%</b> ({s.freelist_pages} free pages)",
+        f"\u2514 \u267b\ufe0f Reclaimable: <b>{_fmt_bytes(s.reclaimable_bytes)}</b>",
+        "",
+        "<b>\U0001f465 Subscribers</b>",
+        f"\u251c \U0001f7e2 Active: <b>{s.subs_active}</b>",
+        f"\u2514 \u26aa\ufe0f Inactive: <b>{s.subs_inactive}</b>",
+        "",
+        "<b>\U0001f4f0 News</b>",
+        f"\u251c \U0001f441\ufe0f Seen (dedup): <b>{s.seen_news}</b>",
+        f"\u251c \U0001f7e1 Pending: <b>{s.pending}</b>",
+        f"\u251c \U0001f7e2 Approved: <b>{s.approved}</b>",
+        f"\u2514 \u26ab\ufe0f Discarded: <b>{s.discarded}</b>",
+        "",
+        "<b>\U0001f6e1\ufe0f Integrity</b>",
+        f"\u2514 {integrity_dot} <b>{integrity_label}</b>",
+        "",
+        THIN_DIVIDER,
+        "\U0001f4a1 Tip: run <code>/dboptimize</code> to prune old rows + reclaim space.",
+    ]
+    if frag >= 25:
+        lines.append("\u26a0\ufe0f High fragmentation \u2014 a VACUUM is recommended.")
+    if not s.integrity_ok:
+        lines.append("\u26a0\ufe0f <b>Integrity check FAILED.</b> Investigate before further writes.")
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("\U0001f9f9 Optimize now", callback_data="db:optimize"),
+        InlineKeyboardButton("\U0001f504 Refresh", callback_data="db:stats"),
+    ]])
+    await msg.reply_html("\n".join(lines), reply_markup=kb)
+
+
+async def cmd_dboptimize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run a full maintenance pass: prune + ANALYZE + VACUUM. Admin-only."""
+    cfg: Config = context.application.bot_data["cfg"]
+    db: Database = context.application.bot_data["db"]
+    user = update.effective_user
+    msg = update.effective_message
+    lang = _resolve_lang(db, user)
+    if user is None or not _is_admin(cfg, user.id):
+        await msg.reply_text(T("admin_only", lang))
+        return
+
+    status = await msg.reply_html("\u23f3 <b>Optimizing database\u2026</b>\nPruning old rows, running ANALYZE + VACUUM.")
+
+    try:
+        result = await asyncio.to_thread(db.optimize)
+    except Exception as e:
+        log.exception("DB optimize failed")
+        await status.edit_text(f"\u26a0\ufe0f Optimization failed: <code>{_escape_for_html(str(e))}</code>", parse_mode=ParseMode.HTML)
+        return
+
+    freed = result["size_freed_bytes"]
+    lines = [
+        "\u2705 <b>Database optimized</b>",
+        DIVIDER,
+        "",
+        "<b>\U0001f5d1\ufe0f Pruned</b>",
+        f"\u251c \U0001f4f0 Old news GUIDs: <b>{result['deleted_news']}</b>",
+        f"\u251c \U0001f5c2\ufe0f Old articles: <b>{result['deleted_articles']}</b>",
+        f"\u2514 \U0001f465 Stale subscribers: <b>{result['deleted_subscribers']}</b>",
+        "",
+        "<b>\U0001f4be Storage</b>",
+        f"\u251c \U0001f4c1 Before: <b>{_fmt_bytes(result['size_before_bytes'])}</b>",
+        f"\u251c \U0001f4c1 After:  <b>{_fmt_bytes(result['size_after_bytes'])}</b>",
+        f"\u2514 \u267b\ufe0f Freed:  <b>{_fmt_bytes(freed)}</b>",
+        "",
+        THIN_DIVIDER,
+        f"\U0001f4cb Retention: news 30d \u00b7 articles 14d \u00b7 inactive subs 90d",
+    ]
+    await status.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def _job_db_maintenance(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Weekly background maintenance: prune + ANALYZE (no VACUUM \u2014 too disruptive).
+    Runs every 7 days from bot startup."""
+    db: Database = context.application.bot_data["db"]
+    cfg: Config = context.application.bot_data["cfg"]
+    log.info("Weekly DB maintenance: starting")
+    try:
+        result = await asyncio.to_thread(
+            db.optimize, do_vacuum=False,
+        )
+        log.info(
+            "Weekly DB maintenance done: "
+            "news=-%d articles=-%d subs=-%d",
+            result["deleted_news"], result["deleted_articles"], result["deleted_subscribers"],
+        )
+        # Notify admin only if something was actually cleaned up.
+        total = (
+            result["deleted_news"]
+            + result["deleted_articles"]
+            + result["deleted_subscribers"]
+        )
+        if total > 0:
+            try:
+                await context.bot.send_message(
+                    chat_id=cfg.admin_user_id,
+                    text=(
+                        f"\U0001f9f9 <b>Weekly DB maintenance</b>\n"
+                        f"Pruned {total} old rows "
+                        f"(news={result['deleted_news']}, "
+                        f"articles={result['deleted_articles']}, "
+                        f"subs={result['deleted_subscribers']})"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass  # don't fail the job if admin DM is unavailable
+    except Exception:
+        log.exception("Weekly DB maintenance FAILED")
 
 
 async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1280,11 +1427,22 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await cmd_schedules(update, context)
         elif action == "sendnews" and is_admin:
             await query.message.reply_html(T("news_loading", lang))
-            await _job_daily_news(context)
+            await _send_news_digest(context)
         elif action == "fetchnews" and is_admin:
             await cmd_fetchnews(update, context)
         elif action == "pending" and is_admin:
             await cmd_pending(update, context)
+        else:
+            await query.message.reply_text(T("action_unavailable", lang))
+        return
+
+    # db:<stats|optimize>  - admin database maintenance buttons
+    if data.startswith("db:") and is_admin:
+        action = data.split(":", 1)[1]
+        if action == "stats":
+            await cmd_dbstats(update, context)
+        elif action == "optimize":
+            await cmd_dboptimize(update, context)
         else:
             await query.message.reply_text(T("action_unavailable", lang))
         return
@@ -1379,7 +1537,9 @@ def _format_digest(items: list[NewsItem], lang: str) -> str:
     return "\n".join(lines)
 
 
-async def _job_daily_news(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _send_news_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Build and broadcast a news digest. Triggered manually only —
+    via /sendnews or the inline news button."""
     cfg: Config = context.application.bot_data["cfg"]
     db: Database = context.application.bot_data["db"]
 
@@ -1387,7 +1547,7 @@ async def _job_daily_news(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     fresh = [i for i in items if not db.is_news_seen(i.guid)]
     if not fresh:
-        log.info("Daily news job: nothing new to send")
+        log.info("News digest: nothing new to send")
         return
 
     digest_items = fresh[: cfg.news_max_items]
@@ -1399,7 +1559,7 @@ async def _job_daily_news(context: ContextTypes.DEFAULT_TYPE) -> None:
     delivered, failed = await _broadcast(
         context, cfg, db, render, disable_web_page_preview=True,
     )
-    log.info("Daily news sent. Delivered=%d failed=%d", delivered, failed)
+    log.info("News digest sent. Delivered=%d failed=%d", delivered, failed)
 
     for it in digest_items:
         db.mark_news_seen(it.guid)
@@ -1491,6 +1651,9 @@ def build_application(cfg: Config) -> Application:
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("sendnews", cmd_sendnews))
     app.add_handler(CommandHandler("sources", cmd_sources))
+    # Database maintenance
+    app.add_handler(CommandHandler("dbstats", cmd_dbstats))
+    app.add_handler(CommandHandler("dboptimize", cmd_dboptimize))
     # News review queue
     app.add_handler(CommandHandler("fetchnews", cmd_fetchnews))
     app.add_handler(CommandHandler("pending", cmd_pending))
@@ -1503,20 +1666,24 @@ def build_application(cfg: Config) -> Application:
     # Inline keyboard button callbacks
     app.add_handler(CallbackQueryHandler(on_button))
 
-    # Schedule daily news
-    hh, mm = (int(x) for x in cfg.daily_news_time.split(":"))
-    tz = ZoneInfo(cfg.timezone)
-    app.job_queue.run_daily(
-        _job_daily_news,
-        time=dtime(hour=hh, minute=mm, tzinfo=tz),
-        name="daily_news",
-    )
-    log.info("Scheduled daily news at %02d:%02d %s", hh, mm, cfg.timezone)
+    # News digest is manual-only as of v3.1.0 — no scheduled job.
+    # Use /sendnews or the inline news button to trigger a broadcast.
+    log.info("News digest mode: manual only (no auto-schedule)")
     log.info(
         "News sources (%d): %s",
         len(cfg.news_sources),
         ", ".join(cfg.news_sources) if cfg.news_sources else "(none)",
     )
+
+    # Weekly DB maintenance (prune + ANALYZE, no VACUUM).
+    # Fires 24h after start, then every 7 days.
+    app.job_queue.run_repeating(
+        _job_db_maintenance,
+        interval=7 * 24 * 3600,
+        first=24 * 3600,
+        name="db_maintenance",
+    )
+    log.info("Scheduled weekly DB maintenance (prune + ANALYZE)")
 
     return app
 
