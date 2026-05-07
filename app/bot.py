@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -221,7 +222,7 @@ def _language_picker_keyboard(current: str) -> InlineKeyboardMarkup:
 
 
 def _is_admin(cfg: Config, user_id: int) -> bool:
-    return user_id == cfg.admin_user_id
+    return cfg.is_admin(user_id)
 
 
 async def _send_one(
@@ -675,20 +676,22 @@ async def _job_db_maintenance(context: ContextTypes.DEFAULT_TYPE) -> None:
             + result["deleted_subscribers"]
         )
         if total > 0:
-            try:
-                await context.bot.send_message(
-                    chat_id=cfg.admin_user_id,
-                    text=(
-                        f"\U0001f9f9 <b>Weekly DB maintenance</b>\n"
-                        f"Pruned {total} old rows "
-                        f"(news={result['deleted_news']}, "
-                        f"articles={result['deleted_articles']}, "
-                        f"subs={result['deleted_subscribers']})"
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-            except TelegramError:
-                pass  # don't fail the job if admin DM is unavailable
+            msg = (
+                f"\U0001f9f9 <b>Weekly DB maintenance</b>\n"
+                f"Pruned {total} old rows "
+                f"(news={result['deleted_news']}, "
+                f"articles={result['deleted_articles']}, "
+                f"subs={result['deleted_subscribers']})"
+            )
+            for admin_id in cfg.admin_user_ids:
+                try:
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=msg,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError:
+                    continue  # try next admin; don't fail the job
     except Exception:
         log.exception("Weekly DB maintenance FAILED")
 
@@ -717,9 +720,283 @@ async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     lines.append("")
     lines.append(THIN_DIVIDER)
     lines.append(
-        "ℹ️ Override via <code>NEWS_SOURCES</code> in <code>.env</code> "
-        "(comma-separated). Leave empty to use Vietnamese defaults."
+        "ℹ️ VN defaults (CafeF · VnExpress · Vietstock) are locked in code since v3.3.0. "
+        "Add extra feeds via <code>NEWS_SOURCES</code> in <code>.env</code> "
+        "or use <code>/setsources add &lt;url&gt;</code> at runtime."
     )
+    await msg.reply_html("\n".join(lines), disable_web_page_preview=True)
+
+
+# --- /setsources (admin) ----------------------------------------------------
+#
+# Lets the admin add or replace EXTRA news feeds at runtime, without SSHing
+# into the VPS to edit .env. The hardcoded VN defaults (CafeF / VnExpress /
+# Vietstock) are ALWAYS kept on top — this command only manages the
+# additive list on top of them.
+#
+# Usage:
+#   /setsources                              — show current extra feeds
+#   /setsources add <url>                    — append one feed
+#   /setsources remove <url|index>           — remove a feed
+#   /setsources reset                        — keep VN defaults only
+#
+# Note: Changes are in-memory only and revert on restart unless you persist
+# them in .env. The reply card reminds the admin of this.
+
+from .config import DEFAULT_VN_SOURCES, is_vn_feed  # noqa: E402
+
+
+async def cmd_setsources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.application.bot_data["cfg"]
+    db: Database = context.application.bot_data["db"]
+    user = update.effective_user
+    msg = update.effective_message
+    lang = _resolve_lang(db, user)
+    if user is None or not _is_admin(cfg, user.id):
+        await msg.reply_text(T("admin_only", lang))
+        return
+
+    args = context.args or []
+    extras = list(s for s in cfg.news_sources if s not in DEFAULT_VN_SOURCES)
+
+    def _render() -> str:
+        out = [
+            "\U0001f4e1 <b>News sources</b>",
+            DIVIDER,
+            f"\U0001f512 <b>VN defaults</b> (always active, locked):",
+        ]
+        for i, u in enumerate(DEFAULT_VN_SOURCES, 1):
+            out.append(f"  <b>{i}.</b> <code>{_escape_for_html(u)}</code>")
+        out.append("")
+        out.append(f"\u2795 <b>Extra feeds</b> ({len(extras)}):")
+        if not extras:
+            out.append("  <i>(none)</i>")
+        else:
+            for i, u in enumerate(extras, 1):
+                tag = "" if is_vn_feed(u) else " \u26a0\ufe0f non-VN"
+                out.append(f"  <b>{i}.</b> <code>{_escape_for_html(u)}</code>{tag}")
+        out.append("")
+        out.append(THIN_DIVIDER)
+        out.append(
+            "<i>Changes are in-memory only. To persist across restarts, "
+            "set <code>NEWS_SOURCES</code> in <code>.env</code> on the VPS.</i>"
+        )
+        return "\n".join(out)
+
+    if not args:
+        await msg.reply_html(_render(), disable_web_page_preview=True)
+        return
+
+    sub = args[0].lower()
+
+    if sub == "reset":
+        # Strip everything except VN defaults
+        new_sources = tuple(DEFAULT_VN_SOURCES)
+        object.__setattr__(cfg, "news_sources", new_sources)  # frozen dataclass
+        log.info("[setsources] reset — only VN defaults active (%d feeds)", len(new_sources))
+        await msg.reply_html(
+            "\u2705 Reset done. Only VN defaults are active now.\n\n" + _render(),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if sub == "add":
+        if len(args) < 2:
+            await msg.reply_text("Usage: /setsources add <url>")
+            return
+        url = args[1].strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            await msg.reply_text("\u274c URL must start with http:// or https://")
+            return
+        if url in cfg.news_sources:
+            await msg.reply_text("\u2139\ufe0f That feed is already active.")
+            return
+        new_sources = tuple(list(cfg.news_sources) + [url])
+        object.__setattr__(cfg, "news_sources", new_sources)
+        log.info("[setsources] added: %s (%d feeds total)", url, len(new_sources))
+        # refresh extras list for the render
+        extras = list(s for s in new_sources if s not in DEFAULT_VN_SOURCES)
+        await msg.reply_html(
+            f"\u2705 Added: <code>{_escape_for_html(url)}</code>\n\n" + _render(),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if sub in ("remove", "rm", "delete"):
+        if len(args) < 2:
+            await msg.reply_text("Usage: /setsources remove <url|index>")
+            return
+        target = args[1].strip()
+        # try index first
+        url_to_remove: str | None = None
+        if target.isdigit():
+            idx = int(target) - 1
+            if 0 <= idx < len(extras):
+                url_to_remove = extras[idx]
+        else:
+            if target in extras:
+                url_to_remove = target
+        if url_to_remove is None:
+            await msg.reply_text(
+                "\u274c Not found in extras. Note: VN defaults cannot be removed."
+            )
+            return
+        new_extras = [u for u in extras if u != url_to_remove]
+        new_sources = tuple(list(DEFAULT_VN_SOURCES) + new_extras)
+        object.__setattr__(cfg, "news_sources", new_sources)
+        log.info("[setsources] removed: %s", url_to_remove)
+        extras = new_extras
+        await msg.reply_html(
+            f"\u2705 Removed: <code>{_escape_for_html(url_to_remove)}</code>\n\n" + _render(),
+            disable_web_page_preview=True,
+        )
+        return
+
+    await msg.reply_text(
+        "Usage:\n"
+        "  /setsources                  — show current\n"
+        "  /setsources add <url>        — append a feed\n"
+        "  /setsources remove <url|N>   — remove an extra feed\n"
+        "  /setsources reset            — VN defaults only"
+    )
+
+
+# --- /adminhealth (admin) ---------------------------------------------------
+#
+# Self-diagnostic for the bot owner. Probes:
+#   1. Each admin's reachability via getChat()
+#   2. DM deliverability (silent test message to the caller)
+#   3. Channel posting permission via getChatMember()
+#   4. Bot token validity via getMe()
+#   5. Uptime + last successful API call
+#
+# IMPORTANT LIMITATION: the Telegram Bot API does NOT expose whether a user
+# is suspended/spam-limited. If an account has a temporary spam limit but
+# can still receive bot DMs, this command will report 'reachable' anyway.
+# Use @SpamBot directly for that case.
+
+
+async def cmd_adminhealth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.application.bot_data["cfg"]
+    db: Database = context.application.bot_data["db"]
+    user = update.effective_user
+    msg = update.effective_message
+    lang = _resolve_lang(db, user)
+    if user is None or not _is_admin(cfg, user.id):
+        await msg.reply_text(T("admin_only", lang))
+        return
+
+    started_at = context.application.bot_data.get("started_at", time.time())
+    uptime_sec = int(time.time() - started_at)
+
+    def _fmt_uptime(s: int) -> str:
+        d, s = divmod(s, 86400)
+        h, s = divmod(s, 3600)
+        m, _ = divmod(s, 60)
+        if d:
+            return f"{d}d {h}h"
+        if h:
+            return f"{h}h {m}m"
+        return f"{m}m"
+
+    lines: list[str] = ["\U0001fa7a <b>Admin &amp; Bot Health</b>", DIVIDER]
+
+    # 1. Bot identity (token validity)
+    lines.append("\U0001f916 <b>Bot</b>")
+    try:
+        me = await context.bot.get_me()
+        lines.append(f"  \U0001f7e2 Token valid: @{_escape_for_html(me.username or '?')}")
+        lines.append(f"  \U0001f7e2 Uptime: {_fmt_uptime(uptime_sec)}")
+    except TelegramError as e:
+        lines.append(f"  \U0001f534 Token check FAILED: {_escape_for_html(str(e))}")
+    lines.append("")
+
+    # 2. Per-admin probe
+    lines.append(f"\U0001f465 <b>Admins</b> ({len(cfg.admin_user_ids)})")
+    for admin_id in cfg.admin_user_ids:
+        marker = " \U0001f44b (you)" if admin_id == user.id else ""
+        lines.append(f"  \u2022 <code>{admin_id}</code>{marker}")
+        # identity probe
+        try:
+            chat = await context.bot.get_chat(admin_id)
+            name = (chat.first_name or "").strip() or "(no name)"
+            uname = f"@{chat.username}" if chat.username else "—"
+            if name == "Deleted Account":
+                lines.append(f"    \U0001f7e1 <b>Deleted Account</b> (detected)")
+            else:
+                lines.append(
+                    f"    \U0001f7e2 Reachable: {_escape_for_html(name)} ({_escape_for_html(uname)})"
+                )
+        except BadRequest as e:
+            lines.append(
+                f"    \U0001f534 chat not found \u2014 ID may be wrong, "
+                f"or admin never /start'd the bot ({_escape_for_html(str(e))})"
+            )
+        except Forbidden:
+            lines.append("    \U0001f534 Forbidden \u2014 bot was blocked or user deactivated")
+        except TelegramError as e:
+            lines.append(f"    \U0001f7e1 Probe error: {_escape_for_html(str(e))}")
+    lines.append("")
+
+    # 3. DM deliverability (silent test to the caller only)
+    lines.append("\U0001f4e8 <b>DM deliverability</b> (this admin)")
+    try:
+        test = await context.bot.send_message(
+            chat_id=user.id,
+            text="\u2705 Health check ping (auto-deletes).",
+            disable_notification=True,
+        )
+        try:
+            await context.bot.delete_message(chat_id=user.id, message_id=test.message_id)
+        except TelegramError:
+            pass
+        lines.append("  \U0001f7e2 Test message: delivered")
+    except Forbidden:
+        lines.append("  \U0001f534 Forbidden \u2014 you blocked the bot, or your account is deactivated")
+    except TelegramError as e:
+        lines.append(f"  \U0001f534 Failed: {_escape_for_html(str(e))}")
+    lines.append("")
+
+    # 4. Channel permissions
+    if cfg.channel_id:
+        lines.append(f"\U0001f4e2 <b>Channel</b> (<code>{_escape_for_html(cfg.channel_id)}</code>)")
+        try:
+            me = await context.bot.get_me()
+            member = await context.bot.get_chat_member(cfg.channel_id, me.id)
+            status = member.status  # 'creator', 'administrator', 'member', 'left', 'kicked'
+            can_post = bool(getattr(member, "can_post_messages", False)) or status == "creator"
+            can_pin = bool(getattr(member, "can_pin_messages", False)) or status == "creator"
+            green = "\U0001f7e2"
+            red = "\U0001f534"
+            yellow = "\U0001f7e1"
+            dot_role = green if status in ("administrator", "creator") else red
+            dot_post = green if can_post else red
+            dot_pin = green if can_pin else yellow
+            lines.append(f"  {dot_role} Role: {status}")
+            lines.append(f"  {dot_post} Can post: {'yes' if can_post else 'no'}")
+            lines.append(f"  {dot_pin} Can pin: {'yes' if can_pin else 'no'}")
+        except TelegramError as e:
+            lines.append(f"  \U0001f534 Probe failed: {_escape_for_html(str(e))}")
+    else:
+        lines.append("\U0001f4e2 <b>Channel</b>")
+        lines.append("  \u26aa CHANNEL_ID not set (broadcasting to subscribers only)")
+    lines.append("")
+
+    # 5. News feeds at-a-glance
+    lines.append(f"\U0001f4e1 <b>News feeds</b>: {len(cfg.news_sources)} active")
+    non_vn = [u for u in cfg.news_sources if not is_vn_feed(u)]
+    if cfg.lang_default == "vi" and non_vn:
+        lines.append(f"  \U0001f7e1 {len(non_vn)} non-VN feed(s) (lang=vi mismatch)")
+    else:
+        lines.append("  \U0001f7e2 All feeds match default language")
+    lines.append("")
+
+    lines.append(THIN_DIVIDER)
+    lines.append(
+        "<i>Note: this command cannot detect Telegram-side spam limits on your "
+        "account. Check <a href='https://t.me/SpamBot'>@SpamBot</a> for that.</i>"
+    )
+
     await msg.reply_html("\n".join(lines), disable_web_page_preview=True)
 
 
@@ -1635,6 +1912,7 @@ def build_application(cfg: Config) -> Application:
     app.bot_data["cfg"] = cfg
     app.bot_data["db"] = db
     app.bot_data["scheduled_jobs"] = {}  # job_id -> ScheduledJob
+    app.bot_data["started_at"] = time.time()  # for /adminhealth uptime
 
     # Public
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1651,6 +1929,8 @@ def build_application(cfg: Config) -> Application:
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("sendnews", cmd_sendnews))
     app.add_handler(CommandHandler("sources", cmd_sources))
+    app.add_handler(CommandHandler("setsources", cmd_setsources))
+    app.add_handler(CommandHandler("adminhealth", cmd_adminhealth))
     # Database maintenance
     app.add_handler(CommandHandler("dbstats", cmd_dbstats))
     app.add_handler(CommandHandler("dboptimize", cmd_dboptimize))
@@ -1695,6 +1975,7 @@ def main() -> None:
     )
     cfg = Config.from_env()
     app = build_application(cfg)
+    app.bot_data["started_at"] = time.time()
     log.info("Bot starting…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
